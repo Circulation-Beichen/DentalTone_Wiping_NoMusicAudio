@@ -50,14 +50,15 @@ def dynamic_deesser(audio, sr, threshold_db=-20, reduction_db=6, crossover=5000)
     
     return low_freq + processed_high
 
-def weighted_high_freq_average(audio, sr, freq_min=4000, freq_max=20000, peak_freq=6500):
+def weighted_high_freq_average(audio, sr, freq_min=4000, freq_max=20000, low_weight=1.0, high_weight=10.0):
     """
-    计算音频的加权高频平均值，使用正态分布权重
+    计算音频的加权高频平均值，使用分段权重
     :param audio: 输入音频信号
     :param sr: 采样率
     :param freq_min: 考虑的最低频率(Hz)
     :param freq_max: 考虑的最高频率(Hz)
-    :param peak_freq: 最高权重的频率中心(Hz)
+    :param low_weight: 低频区域权重(4k-7.5kHz)
+    :param high_weight: 高频区域权重(7.5k-13kHz)
     :return: 加权高频信息
     """
     # 计算STFT
@@ -69,19 +70,27 @@ def weighted_high_freq_average(audio, sr, freq_min=4000, freq_max=20000, peak_fr
     # 获取频率轴
     mel_freqs = librosa.mel_frequencies(n_mels=128, fmin=freq_min, fmax=freq_max)
     
-    # 创建基于正态分布的权重
-    # 定义sigma使得在距离峰值2个sigma的地方权重降低到最大权重的一半
-    sigma = (freq_max - freq_min) / 4  # 这样整个范围约为4个sigma
-    min_weight = 1.0
-    max_weight = 2.0 * min_weight  # 最高点是最低点的2倍
+    # 定义关键频率点
+    transition_start = 7000  # 开始过渡的频率 (Hz)
+    transition_width = 500   # 过渡带宽 (Hz)
+    transition_end = transition_start + transition_width
+    high_freq_end = 13000    # 高权重区域结束 (Hz)
     
-    weights = np.ones_like(mel_freqs) * min_weight
+    weights = np.ones_like(mel_freqs) * low_weight  # 初始化为低频权重
     
+    # 应用分段权重
     for i, freq in enumerate(mel_freqs):
-        # 计算正态分布权重（使用高斯函数）
-        dist_squared = ((freq - peak_freq) / sigma) ** 2
-        # 正态分布公式，但我们调整使得中心是max_weight，远处是min_weight
-        weights[i] = min_weight + (max_weight - min_weight) * np.exp(-0.5 * dist_squared)
+        if freq >= transition_start and freq < transition_end:
+            # 线性过渡区域 - 从低权重平滑过渡到高权重
+            ratio = (freq - transition_start) / transition_width
+            weights[i] = low_weight + (high_weight - low_weight) * ratio
+        elif freq >= transition_end and freq <= high_freq_end:
+            # 高频权重区域
+            weights[i] = high_weight
+        elif freq > high_freq_end:
+            # 13kHz以上区域，权重逐渐降低
+            ratio = min(1.0, (freq - high_freq_end) / 2000)  # 2kHz内平滑过渡回低权重
+            weights[i] = max(low_weight, high_weight - (high_weight - low_weight) * ratio)
     
     # 应用权重
     weighted_mel = mel_spec * weights[:, np.newaxis]
@@ -93,28 +102,55 @@ def weighted_high_freq_average(audio, sr, freq_min=4000, freq_max=20000, peak_fr
 
 def plot_weighted_high_freq_analysis(weighted_avg, mel_spec, weights, sr, output_folder):
     """生成并保存高频加权分析图"""
-    plt.figure(figsize=(12, 8))
-    plt.subplot(3, 1, 1)
+    plt.figure(figsize=(12, 10))
+    # 设置中文字体
+    plt.rcParams['font.sans-serif'] = ['SimHei']  # 用黑体显示中文
+    plt.rcParams['axes.unicode_minus'] = False    # 正常显示负号
+    
+    # 绘制Mel频谱图
+    plt.subplot(4, 1, 1)
     librosa.display.specshow(librosa.power_to_db(mel_spec, ref=np.max),
                            x_axis='time', y_axis='mel', sr=sr,
                            fmin=4000, fmax=20000)
     plt.colorbar(format='%+2.0f dB')
     plt.title('Mel频谱图 (4-20kHz)')
     
-    plt.subplot(3, 1, 2)
-    plt.plot(weights)
+    # 绘制频率与权重对应关系
+    plt.subplot(4, 1, 2)
+    mel_freqs = librosa.mel_frequencies(n_mels=128, fmin=4000, fmax=20000)
+    plt.plot(mel_freqs, weights)
     plt.title('频率权重分布')
-    plt.xlabel('Mel频率索引')
+    plt.xlabel('频率 (Hz)')
     plt.ylabel('权重')
+    plt.grid(True)
     
-    plt.subplot(3, 1, 3)
+    # 增加权重区域颜色标注
+    plt.axvspan(4000, 7000, alpha=0.2, color='green', label='低权重区域 (1)')
+    plt.axvspan(7000, 7500, alpha=0.3, color='yellow', label='过渡区域 (1-10)')
+    plt.axvspan(7500, 13000, alpha=0.2, color='red', label='高权重区域 (10)')
+    plt.axvspan(13000, 20000, alpha=0.3, color='blue', label='降低区域')
+    plt.legend(loc='upper right')
+    
+    # 绘制加权前后的频谱对比
+    plt.subplot(4, 1, 3)
+    plt.plot(np.mean(mel_spec, axis=1), label='原始平均能量')
+    plt.plot(np.mean(mel_spec, axis=1) * weights, label='加权后平均能量')
+    plt.title('频谱加权效果对比')
+    plt.xlabel('Mel频率索引')
+    plt.ylabel('能量')
+    plt.legend()
+    plt.grid(True)
+    
+    # 绘制加权高频平均值随时间的变化
+    plt.subplot(4, 1, 4)
     plt.plot(weighted_avg)
     plt.title('加权高频平均值')
     plt.xlabel('时间帧')
-    plt.ylabel('能量')
+    plt.ylabel('加权能量')
+    plt.grid(True)
     
     plt.tight_layout()
-    plt.savefig(os.path.join(output_folder, "高频加权分析.png"))
+    plt.savefig(os.path.join(output_folder, "高频加权分析.png"), dpi=300)
     plt.close()
 
 def detect_high_freq_clusters_with_optics(audio, sr, time_start=1, time_end=3, freq_threshold=4000, max_reduction_db=10, min_samples=5, xi=0.05, min_cluster_size=0.05, output_dir=None):
@@ -153,7 +189,7 @@ def detect_high_freq_clusters_with_optics(audio, sr, time_start=1, time_end=3, f
     
     # 计算加权高频平均值
     weighted_avg, mel_spec, weights = weighted_high_freq_average(
-        target_segment, sr, freq_min=4000, freq_max=20000, peak_freq=6500
+        target_segment, sr, freq_min=4000, freq_max=20000, low_weight=1.0, high_weight=10.0
     )
     
     # 绘制加权高频平均值图
@@ -269,27 +305,36 @@ def detect_high_freq_clusters_with_optics(audio, sr, time_start=1, time_end=3, f
     # 创建处理后的STFT矩阵
     processed_magnitude = magnitude.copy()
     
-    # 获取mel频率映射到STFT频率的索引
+    # 获取STFT频率轴
     stft_freqs = librosa.fft_frequencies(sr=sr, n_fft=magnitude.shape[0]*2-2)
     
-    # 创建一个与stft_freqs相同大小的权重数组
-    stft_weights = np.ones_like(stft_freqs)
+    # 为不同频率段创建权重
+    transition_start = 7000  # 开始过渡的频率 (Hz)
+    transition_width = 500   # 过渡带宽 (Hz)
+    transition_end = transition_start + transition_width
+    high_freq_end = 13000    # 高权重区域结束 (Hz)
     
-    # 为高频部分(>=4kHz)计算与之前相同的正态分布权重
-    high_freq_stft_indices = np.where(stft_freqs >= freq_threshold)[0]
-    peak_freq = 6500  # 与之前的加权分析相同
-    sigma = (20000 - 4000) / 4  # 与加权分析相同
-    min_weight = 1.0
-    max_weight = 2.0 * min_weight  # 最高点是最低点的2倍
+    # 创建用于增益调整的权重数组
+    gain_weights = np.ones_like(stft_freqs)
     
-    for i in high_freq_stft_indices:
-        freq = stft_freqs[i]
-        # 计算正态分布权重
-        dist_squared = ((freq - peak_freq) / sigma) ** 2
-        stft_weights[i] = min_weight + (max_weight - min_weight) * np.exp(-0.5 * dist_squared)
-    
-    # 标准化权重，使最大值为1
-    stft_weights = stft_weights / np.max(stft_weights)
+    for i, freq in enumerate(stft_freqs):
+        if freq < freq_threshold:
+            # 低于阈值的频率不处理
+            gain_weights[i] = 0
+        elif freq >= freq_threshold and freq < transition_start:
+            # 4kHz到7kHz区域，低权重
+            gain_weights[i] = 1.0
+        elif freq >= transition_start and freq < transition_end:
+            # 7kHz到7.5kHz的过渡区域
+            ratio = (freq - transition_start) / transition_width
+            gain_weights[i] = 1.0 + 9.0 * ratio  # 从1平滑过渡到10
+        elif freq >= transition_end and freq <= high_freq_end:
+            # 7.5kHz到13kHz区域，高权重
+            gain_weights[i] = 10.0
+        elif freq > high_freq_end:
+            # 13kHz以上区域，权重逐渐降低
+            ratio = min(1.0, (freq - high_freq_end) / 2000)  # 2kHz内平滑过渡回低权重
+            gain_weights[i] = max(1.0, 10.0 - 9.0 * ratio)   # 从10平滑过渡到1
     
     # 在每个聚类中心时间的高频范围上应用衰减
     for t_idx, _, _, _ in cluster_centers:
@@ -300,22 +345,23 @@ def detect_high_freq_clusters_with_optics(audio, sr, time_start=1, time_end=3, f
         t_start = max(0, t_idx - t_window)
         t_end = min(processed_magnitude.shape[1], t_idx + t_window + 1)
         
-        # 只对高频部分应用增益，和使用与识别时相同的权重分布
+        # 只对高频部分应用增益，根据频率权重调整
         for f_idx in high_freq_indices:
-            # 获取该频率的权重，用于调整增益
-            freq_weight = stft_weights[f_idx]
+            # 获取该频率的权重
+            freq_weight = gain_weights[f_idx]
             
-            # 计算该频率点的负增益，权重越高，负增益越大，但不超过最大负增益
-            reduction_db = max_reduction_db * freq_weight
-            gain_factor = 10 ** (-reduction_db / 20)  # 将dB转换为线性增益因子
-            
-            # 创建高斯时间衰减窗口，使得衰减在中心时间最强，向外逐渐减弱
-            t_coords = np.arange(t_start, t_end)
-            gaussian_window = np.exp(-0.5 * (((t_coords - t_idx) / (t_window / 2)) ** 2))
-            
-            # 应用衰减，中心时间点衰减最大，周围逐渐减弱
-            attenuation_factor = 1 - ((1 - gain_factor) * gaussian_window)
-            processed_magnitude[f_idx, t_start:t_end] *= attenuation_factor
+            if freq_weight > 0:  # 只处理有权重的频率（跳过低于阈值的频率）
+                # 计算该频率点的负增益，权重越高，负增益越大
+                reduction_db = max_reduction_db * (freq_weight / 10.0)  # 根据权重比例调整增益
+                gain_factor = 10 ** (-reduction_db / 20)  # 将dB转换为线性增益因子
+                
+                # 创建高斯时间衰减窗口，使得衰减在中心时间最强，向外逐渐减弱
+                t_coords = np.arange(t_start, t_end)
+                gaussian_window = np.exp(-0.5 * (((t_coords - t_idx) / (t_window / 2)) ** 2))
+                
+                # 应用衰减，中心时间点衰减最大，周围逐渐减弱
+                attenuation_factor = 1 - ((1 - gain_factor) * gaussian_window)
+                processed_magnitude[f_idx, t_start:t_end] *= attenuation_factor
     
     # 重建音频信号
     processed_D = processed_magnitude * np.exp(1j * phase)
