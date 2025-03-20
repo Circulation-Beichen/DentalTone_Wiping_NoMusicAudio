@@ -13,6 +13,9 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report
 import joblib
 from scipy.signal import find_peaks
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 
 # 项目根目录路径
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -258,16 +261,16 @@ def train_string_instrument_classifier(audio_path, segment_duration=3, overlap=1
     
     return clf, accuracy
 
-def detect_and_process_peaks(audio, sr, time_start=1, time_end=3, freq_threshold=5000, gain_db=-30, peak_count=3):
+def detect_high_freq_clusters(audio, sr, time_start=1, time_end=3, freq_threshold=5000, gain_db=-20, n_clusters=3):
     """
-    检测并处理指定时间范围内的高频极大值
+    使用DPCA算法检测并处理指定时间范围内的高频聚类
     :param audio: 输入音频信号
     :param sr: 采样率
     :param time_start: 起始时间(秒)
     :param time_end: 结束时间(秒)
-    :param freq_threshold: 频率阈值，只处理高于此频率的峰值(Hz)
-    :param gain_db: 应用于峰值的增益(dB)
-    :param peak_count: 要处理的峰值数量
+    :param freq_threshold: 频率阈值，只处理高于此频率的成分(Hz)
+    :param gain_db: 应用于聚类的增益(dB)
+    :param n_clusters: 聚类数量
     :return: 处理后的音频
     """
     # 将时间转换为样本索引
@@ -288,34 +291,77 @@ def detect_and_process_peaks(audio, sr, time_start=1, time_end=3, freq_threshold
     
     # 只考虑高于频率阈值的部分
     high_freq_indices = np.where(freqs >= freq_threshold)[0]
+    
+    # 提取高频部分的频谱数据
     high_freq_magnitudes = magnitude[high_freq_indices, :]
     
-    # 对每个时间帧寻找峰值位置
-    peaks_list = []
+    # 转换为特征表示形式，用于聚类
+    features = []
+    positions = []
+    
+    # 对每个时间帧检测峰值
     for t in range(high_freq_magnitudes.shape[1]):
         frame_magnitude = high_freq_magnitudes[:, t]
-        peaks, _ = find_peaks(frame_magnitude, height=np.mean(frame_magnitude) + 2*np.std(frame_magnitude))
-        if len(peaks) > 0:
-            for peak in peaks:
-                actual_freq_idx = high_freq_indices[peak]
-                peaks_list.append((t, actual_freq_idx, magnitude[actual_freq_idx, t]))
+        # 使用find_peaks寻找当前时间帧中的局部极大值
+        peaks, _ = find_peaks(frame_magnitude, height=np.mean(frame_magnitude) + np.std(frame_magnitude))
+        
+        for p in peaks:
+            actual_freq_idx = high_freq_indices[p]
+            mag = magnitude[actual_freq_idx, t]
+            mag_db = librosa.amplitude_to_db(mag, ref=np.max)
+            
+            # 只保留幅度较大的峰值
+            if mag_db > -30:  # 幅度阈值
+                # 特征向量：[时间, 频率, 振幅, 相对振幅]
+                # 相对振幅表示与周围峰值的差异
+                relative_mag = mag / (np.mean(magnitude[:, t]) + 1e-10)
+                features.append([times[t], freqs[actual_freq_idx], mag, relative_mag])
+                positions.append((t, actual_freq_idx))
     
-    # 按幅度排序并选择最强的几个峰值
-    peaks_list.sort(key=lambda x: x[2], reverse=True)
-    top_peaks = peaks_list[:peak_count]
+    if len(features) < n_clusters:
+        print(f"警告: 检测到的峰值数量({len(features)})少于请求的聚类数量({n_clusters})")
+        n_clusters = max(1, len(features))
     
-    print(f"检测到的{peak_count}个高频极大值:")
-    for i, (t, f_idx, mag) in enumerate(top_peaks):
-        print(f"峰值 #{i+1}: 时间={times[t]:.2f}秒, 频率={freqs[f_idx]:.1f}Hz, 幅度={librosa.amplitude_to_db(mag):.1f}dB")
+    if len(features) == 0:
+        print("未检测到显著的高频峰值")
+        return audio
+    
+    # 标准化特征
+    features_array = np.array(features)
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features_array)
+    
+    # 使用PCA降维
+    pca = PCA(n_components=min(features_scaled.shape[1], 2))
+    features_pca = pca.fit_transform(features_scaled)
+    
+    # KMeans聚类
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    clusters = kmeans.fit_predict(features_pca)
+    
+    # 计算每个聚类的中心点和最具代表性的峰值
+    cluster_centers = []
+    for i in range(n_clusters):
+        cluster_indices = np.where(clusters == i)[0]
+        if len(cluster_indices) > 0:
+            # 找出聚类中振幅最大的峰值作为代表
+            max_amp_idx = cluster_indices[np.argmax(features_array[cluster_indices, 2])]
+            t_idx, f_idx = positions[max_amp_idx]
+            amp = features_array[max_amp_idx, 2]
+            cluster_centers.append((t_idx, f_idx, amp))
+    
+    print(f"检测到的{len(cluster_centers)}个高频聚类中心:")
+    for i, (t, f_idx, amp) in enumerate(cluster_centers):
+        print(f"聚类 #{i+1}: 时间={times[t]:.2f}秒, 频率={freqs[f_idx]:.1f}Hz, 幅度={librosa.amplitude_to_db(amp):.1f}dB")
     
     # 创建处理后的STFT矩阵
     processed_magnitude = magnitude.copy()
     
-    # 在每个峰值周围应用衰减
-    for t, f_idx, _ in top_peaks:
+    # 在每个聚类中心周围应用衰减
+    for t, f_idx, _ in cluster_centers:
         # 定义时间和频率的窗口范围
-        t_window = 5  # 时间范围窗口大小
-        f_window = 10  # 频率范围窗口大小
+        t_window = 8  # 时间范围窗口大小，比之前大以覆盖整个聚类
+        f_window = 15  # 频率范围窗口大小，比之前大以覆盖整个聚类
         
         # 安全地获取周围区域
         t_start = max(0, t - t_window)
@@ -325,7 +371,20 @@ def detect_and_process_peaks(audio, sr, time_start=1, time_end=3, freq_threshold
         
         # 应用增益
         gain_factor = 10 ** (gain_db / 20)  # 将dB转换为线性增益因子
-        processed_magnitude[f_start:f_end, t_start:t_end] *= gain_factor
+        
+        # 创建高斯衰减窗口，使得衰减在中心最强，向外逐渐减弱
+        t_coords, f_coords = np.meshgrid(
+            np.arange(t_start, t_end), 
+            np.arange(f_start, f_end)
+        )
+        gaussian_window = np.exp(-0.5 * (
+            ((t_coords - t) / (t_window / 2)) ** 2 + 
+            ((f_coords - f_idx) / (f_window / 2)) ** 2
+        ))
+        
+        # 应用衰减，中心点衰减最大，周围逐渐减弱
+        attenuation_factor = 1 - ((1 - gain_factor) * gaussian_window)
+        processed_magnitude[f_start:f_end, t_start:t_end] *= attenuation_factor
     
     # 重建音频信号
     processed_D = processed_magnitude * np.exp(1j * phase)
@@ -336,6 +395,60 @@ def detect_and_process_peaks(audio, sr, time_start=1, time_end=3, freq_threshold
     result[start_sample:start_sample + len(processed_segment)] = processed_segment
     
     return result
+
+def extract_string_instruments(audio, sr, model_path=None):
+    """
+    从音频中提取弦乐部分
+    :param audio: 输入音频信号
+    :param sr: 采样率
+    :param model_path: 训练好的弦乐识别模型路径
+    :return: 仅包含弦乐的音频信号
+    """
+    if model_path is None:
+        model_path = os.path.join(ROOT_DIR, "string_instrument_classifier.joblib")
+    
+    if not os.path.exists(model_path):
+        print(f"错误: 未找到模型文件 {model_path}")
+        print("请先训练模型")
+        return audio
+    
+    # 加载模型
+    clf = joblib.load(model_path)
+    
+    # 分割音频为小段进行处理
+    segment_duration = 0.5  # 秒
+    hop_length_duration = 0.25  # 秒
+    
+    samples_per_segment = int(segment_duration * sr)
+    hop_length_samples = int(hop_length_duration * sr)
+    
+    # 创建相同长度的输出音频，初始化为零
+    output_audio = np.zeros_like(audio)
+    
+    # 使用窗口函数进行平滑过渡
+    window = np.hanning(samples_per_segment)
+    
+    # 逐段处理
+    for start_sample in range(0, len(audio) - samples_per_segment, hop_length_samples):
+        end_sample = start_sample + samples_per_segment
+        segment = audio[start_sample:end_sample]
+        
+        # 提取特征
+        features = extract_features(segment, sr).reshape(1, -1)
+        
+        # 预测当前段是否包含弦乐
+        prediction = clf.predict(features)[0]
+        
+        # 如果预测为弦乐，则保留该段
+        if prediction == 1:  # 弦乐主导
+            # 应用窗口函数使过渡平滑
+            output_audio[start_sample:end_sample] += segment * window
+    
+    # 标准化输出音频
+    if np.max(np.abs(output_audio)) > 0:
+        output_audio = output_audio / np.max(np.abs(output_audio)) * np.max(np.abs(audio))
+    
+    return output_audio
 
 # 使用示例
 if __name__ == "__main__":
@@ -369,28 +482,28 @@ if __name__ == "__main__":
         original_mp3 = "原始音频片段.mp3"
         save_as_mp3(audio, sr, original_mp3)
         
-        # 先处理1-3秒的三个高频极大值
-        print("检测并处理1-3秒内的高频峰值...")
-        processed_peaks = detect_and_process_peaks(
+        # 使用DPCA算法处理高频聚类
+        print("使用DPCA算法检测并处理高频聚类...")
+        processed_clusters = detect_high_freq_clusters(
             audio, sr, 
             time_start=1, time_end=3, 
             freq_threshold=5000, 
-            gain_db=-30, 
-            peak_count=3
+            gain_db=-20, 
+            n_clusters=3
         )
         
-        # 绘制峰值处理后的频谱图
-        print("生成峰值处理后的频谱图...")
-        plot_spectrogram(processed_peaks, sr, f"高频峰值处理后频谱图 ({audio_file_name}: {start_time}-{end_time}秒)", "峰值处理后频谱图.png")
+        # 绘制聚类处理后的频谱图
+        print("生成聚类处理后的频谱图...")
+        plot_spectrogram(processed_clusters, sr, f"高频聚类处理后频谱图 ({audio_file_name}: {start_time}-{end_time}秒)", "聚类处理后频谱图.png")
         
-        # 保存峰值处理结果
-        print("保存峰值处理后音频...")
-        peaks_processed_mp3 = "峰值处理后音频.mp3"
-        save_as_mp3(processed_peaks, sr, peaks_processed_mp3)
+        # 保存聚类处理结果
+        print("保存聚类处理后音频...")
+        clusters_processed_mp3 = "聚类处理后音频.mp3"
+        save_as_mp3(processed_clusters, sr, clusters_processed_mp3)
         
         # 应用齿音消除
         print("应用齿音消除...")
-        processed = dynamic_deesser(processed_peaks, sr, 
+        processed = dynamic_deesser(processed_clusters, sr, 
                                   threshold_db=-18,
                                   reduction_db=10,
                                   crossover=6000)
@@ -404,22 +517,73 @@ if __name__ == "__main__":
         processed_mp3 = "处理后音频.mp3"
         save_as_mp3(processed, sr, processed_mp3)
         
-        print(f"处理完成！\n原始音频：{os.path.join(ROOT_DIR, original_mp3)}\n峰值处理后音频：{os.path.join(ROOT_DIR, peaks_processed_mp3)}\n齿音消除后音频：{os.path.join(ROOT_DIR, processed_mp3)}\n频谱图已保存为PNG文件。")
+        print(f"处理完成！\n原始音频：{os.path.join(ROOT_DIR, original_mp3)}\n聚类处理后音频：{os.path.join(ROOT_DIR, clusters_processed_mp3)}\n齿音消除后音频：{os.path.join(ROOT_DIR, processed_mp3)}\n频谱图已保存为PNG文件。")
     except Exception as e:
         print(f"处理齿音消除时出错: {str(e)}")
     
-    # 2. 弦乐识别训练
-    print("\n开始弦乐识别模型训练...")
+    # 2. 弦乐识别训练与处理
+    print("\n开始弦乐处理...")
     string_file_name = "卡拉扬_贝多芬第五交响.mp3"
     string_audio_path = os.path.join(ROOT_DIR, string_file_name)
     
     try:
-        if os.path.exists(string_audio_path):
+        # 先检查模型是否已存在
+        model_path = os.path.join(ROOT_DIR, "string_instrument_classifier.joblib")
+        model_exists = os.path.exists(model_path)
+        
+        if not model_exists and os.path.exists(string_audio_path):
             # 训练弦乐识别模型
+            print("开始训练弦乐识别模型...")
             clf, accuracy = train_string_instrument_classifier(string_audio_path)
             print(f"弦乐识别模型训练完成，准确率: {accuracy:.4f}")
-        else:
+        elif not model_exists:
             print(f"错误: 找不到训练素材文件 '{string_audio_path}'")
             print(f"请将 '{string_file_name}' 文件放到以下目录并再次运行:\n{ROOT_DIR}")
+        else:
+            print(f"模型已存在: {model_path}")
+        
+        # 提取弦乐和非弦乐示例
+        if os.path.exists(string_audio_path):
+            print("从交响乐中提取弦乐和非弦乐示例...")
+            
+            # 加载完整音频
+            full_audio, sr = librosa.load(string_audio_path, sr=None, duration=120)  # 加载前2分钟
+            
+            # 提取非弦乐部分（前1/3）
+            non_string_start_time = 10  # 秒
+            non_string_duration = 4  # 秒
+            non_string_offset = int(non_string_start_time * sr)
+            non_string_segment = full_audio[non_string_offset:non_string_offset + int(non_string_duration * sr)]
+            
+            # 保存非弦乐示例
+            non_string_mp3 = "非弦乐示例.mp3"
+            save_as_mp3(non_string_segment, sr, non_string_mp3)
+            plot_spectrogram(non_string_segment, sr, "非弦乐示例频谱图", "非弦乐示例频谱图.png")
+            
+            # 提取弦乐部分（后2/3）
+            string_start_time = 60  # 秒
+            string_duration = 4  # 秒
+            string_offset = int(string_start_time * sr)
+            string_segment = full_audio[string_offset:string_offset + int(string_duration * sr)]
+            
+            # 保存弦乐示例
+            string_mp3 = "弦乐示例.mp3"
+            save_as_mp3(string_segment, sr, string_mp3)
+            plot_spectrogram(string_segment, sr, "弦乐示例频谱图", "弦乐示例频谱图.png")
+            
+            # 从弦乐示例中提取纯弦乐声音
+            if os.path.exists(model_path):
+                print("从弦乐示例中提取纯弦乐声音...")
+                extracted_strings = extract_string_instruments(string_segment, sr, model_path)
+                extracted_strings_mp3 = "提取的纯弦乐声音.mp3"
+                save_as_mp3(extracted_strings, sr, extracted_strings_mp3)
+                plot_spectrogram(extracted_strings, sr, "提取的纯弦乐声音频谱图", "提取的纯弦乐声音频谱图.png")
+                print(f"纯弦乐声音已保存到: {os.path.join(ROOT_DIR, extracted_strings_mp3)}")
+            
+            print(f"弦乐示例已保存到: {os.path.join(ROOT_DIR, string_mp3)}")
+            print(f"非弦乐示例已保存到: {os.path.join(ROOT_DIR, non_string_mp3)}")
+        
     except Exception as e:
-        print(f"弦乐识别模型训练时出错: {str(e)}")
+        print(f"弦乐处理时出错: {str(e)}")
+        import traceback
+        traceback.print_exc()
