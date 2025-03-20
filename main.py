@@ -16,6 +16,8 @@ from scipy.signal import find_peaks
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+import warnings
+warnings.filterwarnings('ignore')
 
 # 项目根目录路径
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -261,9 +263,124 @@ def train_string_instrument_classifier(audio_path, segment_duration=3, overlap=1
     
     return clf, accuracy
 
-def detect_high_freq_clusters(audio, sr, time_start=1, time_end=3, freq_threshold=5000, gain_db=-20, n_clusters=3):
+def weighted_high_freq_average(audio, sr, freq_min=4000, freq_max=20000, peak_freq=6500):
     """
-    使用DPCA算法检测并处理指定时间范围内的高频聚类
+    计算音频的加权高频平均值，5k-8kHz权重最高
+    :param audio: 输入音频信号
+    :param sr: 采样率
+    :param freq_min: 考虑的最低频率(Hz)
+    :param freq_max: 考虑的最高频率(Hz)
+    :param peak_freq: 最高权重的频率中心(Hz)
+    :return: 加权高频信息
+    """
+    # 计算STFT
+    S = np.abs(librosa.stft(audio))
+    
+    # 转换为Mel频谱图
+    mel_spec = librosa.feature.melspectrogram(S=S, sr=sr, n_mels=128, fmin=freq_min, fmax=freq_max)
+    
+    # 获取频率轴
+    mel_freqs = librosa.mel_frequencies(n_mels=128, fmin=freq_min, fmax=freq_max)
+    
+    # 创建权重，5k-8kHz处权重为3，向两侧递减到1
+    weights = np.ones_like(mel_freqs)
+    
+    for i, freq in enumerate(mel_freqs):
+        # 距离峰值频率的距离，并标准化到0-1范围
+        dist = min(abs(freq - peak_freq) / (peak_freq - freq_min), 1.0)
+        # 根据距离计算权重，最大为3，最小为1
+        weights[i] = max(3 * (1 - dist), 1.0)
+    
+    # 应用权重
+    weighted_mel = mel_spec * weights[:, np.newaxis]
+    
+    # 计算加权平均值
+    weighted_avg = np.mean(weighted_mel, axis=0)
+    
+    return weighted_avg, mel_spec, weights
+
+def improved_string_extraction(audio, sr):
+    """
+    改进的弦乐提取方法，使用频谱特征和谐波跟踪
+    :param audio: 输入音频
+    :param sr: 采样率
+    :return: 提取的弦乐音频
+    """
+    # 1. 频谱分析
+    D = librosa.stft(audio, n_fft=2048, hop_length=512)
+    magnitude = np.abs(D)
+    phase = np.angle(D)
+    
+    # 2. 谐波增强 - 弦乐有丰富的谐波结构
+    harmonic = librosa.effects.harmonic(audio, margin=8.0)
+    
+    # 3. 计算谐波-打击乐分离
+    D_harmonic = librosa.stft(harmonic, n_fft=2048, hop_length=512)
+    
+    # 4. 提取谐波部分的特征
+    # 谱平滑度 - 弦乐较平滑
+    spectral_flatness = librosa.feature.spectral_flatness(S=magnitude)
+    
+    # 计算频谱对比度 - 弦乐有显著的谐波峰值
+    contrast = librosa.feature.spectral_contrast(S=magnitude, sr=sr)
+    
+    # 5. 创建弦乐掩码
+    # 低平滑度且高对比度的区域更可能是弦乐
+    
+    # 打印维度信息用于调试
+    print(f"Magnitude shape: {magnitude.shape}")
+    print(f"Spectral flatness shape: {spectral_flatness.shape}")
+    
+    # spectral_flatness是一个(1, n_frames)形状的数组，我们需要改变处理方式
+    
+    # 首先，将spectral_flatness调整为一维数组
+    flatness_values = spectral_flatness[0]  # 变为(n_frames,)
+    
+    # 设置阈值
+    flatness_threshold = np.percentile(flatness_values, 70)
+    
+    # 创建一个(n_freqs, n_frames)形状的初始掩码矩阵
+    mask = np.zeros_like(magnitude, dtype=bool)
+    
+    # 基于时间帧的平滑度创建掩码
+    # 对每一个时间帧，所有频率点使用相同的掩码值
+    for i in range(magnitude.shape[1]):
+        # 如果该帧的平滑度低于阈值（可能是弦乐），则在掩码中标记为True
+        if flatness_values[i] < flatness_threshold:
+            mask[:, i] = True
+    
+    # 谐波增强参数
+    harmonic_gain = 1.5  # 提升谐波成分
+    percussive_reduction = 0.3  # 降低打击乐成分
+    
+    # 应用掩码和谐波增强
+    enhanced_magnitude = np.where(
+        mask, 
+        magnitude * harmonic_gain,  # 谐波增强
+        magnitude * percussive_reduction  # 打击乐降低
+    )
+    
+    # 保留低于2000Hz的成分，弦乐主要集中在这一区域
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
+    for i, freq in enumerate(freqs):
+        if freq > 2000:
+            factor = np.exp(-0.001 * (freq - 2000))  # 逐渐衰减高频
+            enhanced_magnitude[i, :] *= factor
+    
+    # 重建音频
+    y_enhanced = librosa.istft(enhanced_magnitude * np.exp(1j * phase))
+    
+    # 6. 应用额外的谐波滤波器
+    y_enhanced = librosa.effects.harmonic(y_enhanced)
+    
+    # 7. 标准化
+    y_enhanced = y_enhanced / np.max(np.abs(y_enhanced))
+    
+    return y_enhanced
+
+def detect_high_freq_clusters_with_weights(audio, sr, time_start=1, time_end=3, freq_threshold=4000, gain_db=-20, n_clusters=3):
+    """
+    使用加权Mel频率特征的DPCA算法检测并处理指定时间范围内的高频聚类
     :param audio: 输入音频信号
     :param sr: 采样率
     :param time_start: 起始时间(秒)
@@ -280,6 +397,36 @@ def detect_high_freq_clusters(audio, sr, time_start=1, time_end=3, freq_threshol
     # 提取目标时间范围内的音频片段
     target_segment = audio[start_sample:end_sample]
     
+    # 计算加权高频平均值
+    weighted_avg, mel_spec, weights = weighted_high_freq_average(
+        target_segment, sr, freq_min=4000, freq_max=20000, peak_freq=6500
+    )
+    
+    # 绘制加权高频平均值
+    plt.figure(figsize=(12, 8))
+    plt.subplot(3, 1, 1)
+    librosa.display.specshow(librosa.power_to_db(mel_spec, ref=np.max),
+                           x_axis='time', y_axis='mel', sr=sr,
+                           fmin=4000, fmax=20000)
+    plt.colorbar(format='%+2.0f dB')
+    plt.title('Mel频谱图 (4-20kHz)')
+    
+    plt.subplot(3, 1, 2)
+    plt.plot(weights)
+    plt.title('频率权重分布')
+    plt.xlabel('Mel频率索引')
+    plt.ylabel('权重')
+    
+    plt.subplot(3, 1, 3)
+    plt.plot(weighted_avg)
+    plt.title('加权高频平均值')
+    plt.xlabel('时间帧')
+    plt.ylabel('能量')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(ROOT_DIR, "高频加权分析.png"))
+    plt.close()
+    
     # 计算短时傅里叶变换
     D = librosa.stft(target_segment)
     magnitude = np.abs(D)
@@ -289,102 +436,142 @@ def detect_high_freq_clusters(audio, sr, time_start=1, time_end=3, freq_threshol
     freqs = librosa.fft_frequencies(sr=sr)
     times = librosa.frames_to_time(np.arange(D.shape[1]), sr=sr)
     
-    # 只考虑高于频率阈值的部分
+    # 只考虑高于频率阈值的部分的频谱平均值
     high_freq_indices = np.where(freqs >= freq_threshold)[0]
-    
-    # 提取高频部分的频谱数据
     high_freq_magnitudes = magnitude[high_freq_indices, :]
     
-    # 转换为特征表示形式，用于聚类
-    features = []
-    positions = []
-    
-    # 对每个时间帧检测峰值
+    # 对每个时间帧计算高频平均幅度
+    time_features = []
     for t in range(high_freq_magnitudes.shape[1]):
         frame_magnitude = high_freq_magnitudes[:, t]
-        # 使用find_peaks寻找当前时间帧中的局部极大值
-        peaks, _ = find_peaks(frame_magnitude, height=np.mean(frame_magnitude) + np.std(frame_magnitude))
-        
-        for p in peaks:
-            actual_freq_idx = high_freq_indices[p]
-            mag = magnitude[actual_freq_idx, t]
-            mag_db = librosa.amplitude_to_db(mag, ref=np.max)
-            
-            # 只保留幅度较大的峰值
-            if mag_db > -30:  # 幅度阈值
-                # 特征向量：[时间, 频率, 振幅, 相对振幅]
-                # 相对振幅表示与周围峰值的差异
-                relative_mag = mag / (np.mean(magnitude[:, t]) + 1e-10)
-                features.append([times[t], freqs[actual_freq_idx], mag, relative_mag])
-                positions.append((t, actual_freq_idx))
+        # 计算当前时间帧的高频平均幅度
+        avg_magnitude = np.mean(frame_magnitude)
+        # 将时间和平均幅度作为特征
+        time_features.append([times[t], avg_magnitude, weighted_avg[min(t, len(weighted_avg)-1)]])
     
-    if len(features) < n_clusters:
-        print(f"警告: 检测到的峰值数量({len(features)})少于请求的聚类数量({n_clusters})")
-        n_clusters = max(1, len(features))
+    # 转换为numpy数组
+    time_features_array = np.array(time_features)
     
-    if len(features) == 0:
-        print("未检测到显著的高频峰值")
+    if len(time_features_array) == 0:
+        print("未检测到有效的时间帧数据")
         return audio
     
-    # 标准化特征
-    features_array = np.array(features)
+    # 归一化特征，只使用幅度和加权值（排除时间）
+    features_for_clustering = time_features_array[:, 1:]
     scaler = StandardScaler()
-    features_scaled = scaler.fit_transform(features_array)
+    features_scaled = scaler.fit_transform(features_for_clustering)
     
-    # 使用PCA降维
-    pca = PCA(n_components=min(features_scaled.shape[1], 2))
-    features_pca = pca.fit_transform(features_scaled)
+    # 实现密度峰值聚类 (DPCA)
+    # 1. 计算每对点之间的距离矩阵
+    num_points = features_scaled.shape[0]
+    dist_matrix = np.zeros((num_points, num_points))
+    for i in range(num_points):
+        for j in range(i+1, num_points):
+            dist = np.sqrt(np.sum((features_scaled[i] - features_scaled[j])**2))
+            dist_matrix[i, j] = dist
+            dist_matrix[j, i] = dist
     
-    # KMeans聚类
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-    clusters = kmeans.fit_predict(features_pca)
+    # 2. 计算每个点的局部密度 rho
+    dc = np.percentile(dist_matrix[dist_matrix > 0], 20)  # 距离截断值设为所有距离的20%分位数
+    rho = np.zeros(num_points)
+    for i in range(num_points):
+        # 计算高斯密度
+        rho[i] = np.sum(np.exp(-(dist_matrix[i] / dc)**2))
     
-    # 计算每个聚类的中心点和最具代表性的峰值
+    # 3. 对于每个点，找到距离它最近的且密度更高的点的距离
+    delta = np.ones(num_points) * np.max(dist_matrix)
+    nearest_neighbor = np.ones(num_points, dtype=int) * -1
+    
+    # 对点按密度排序
+    rho_order = np.argsort(-rho)
+    
+    for i in range(1, num_points):
+        idx = rho_order[i]
+        for j in range(i):
+            prev_idx = rho_order[j]
+            if dist_matrix[idx, prev_idx] < delta[idx]:
+                delta[idx] = dist_matrix[idx, prev_idx]
+                nearest_neighbor[idx] = prev_idx
+    
+    # 对密度最高的点，delta是最大的距离
+    delta[rho_order[0]] = np.max(delta)
+    
+    # 4. 确定聚类中心：高密度和高delta的点
+    # 计算gamma值
+    gamma = rho * delta
+    cluster_centers_idx = np.argsort(-gamma)[:n_clusters]
+    
+    # 可视化决策图
+    plt.figure(figsize=(10, 8))
+    plt.scatter(rho, delta, s=20, c='k', alpha=0.5)
+    plt.scatter(rho[cluster_centers_idx], delta[cluster_centers_idx], s=80, c='r', marker='*')
+    for i, idx in enumerate(cluster_centers_idx):
+        plt.annotate(f'聚类中心 #{i+1}', (rho[idx], delta[idx]))
+    plt.xlabel('局部密度 (rho)')
+    plt.ylabel('距离 (delta)')
+    plt.title('DPCA 聚类决策图')
+    plt.savefig(os.path.join(ROOT_DIR, "DPCA_聚类决策图.png"))
+    plt.close()
+    
+    # 5. 分配每个点到最近的聚类中心
+    cluster_assignments = np.zeros(num_points, dtype=int) - 1
+    
+    # 首先分配聚类中心
+    for i, idx in enumerate(cluster_centers_idx):
+        cluster_assignments[idx] = i
+    
+    # 按密度从高到低分配其余点
+    for i in range(num_points):
+        idx = rho_order[i]
+        if cluster_assignments[idx] == -1:  # 如果尚未分配
+            if nearest_neighbor[idx] != -1:  # 确保有邻居
+                cluster_assignments[idx] = cluster_assignments[nearest_neighbor[idx]]
+    
+    # 找出每个聚类中能量最高的时间帧
     cluster_centers = []
     for i in range(n_clusters):
-        cluster_indices = np.where(clusters == i)[0]
+        cluster_indices = np.where(cluster_assignments == i)[0]
         if len(cluster_indices) > 0:
-            # 找出聚类中振幅最大的峰值作为代表
-            max_amp_idx = cluster_indices[np.argmax(features_array[cluster_indices, 2])]
-            t_idx, f_idx = positions[max_amp_idx]
-            amp = features_array[max_amp_idx, 2]
-            cluster_centers.append((t_idx, f_idx, amp))
+            # 找出聚类中加权能量最高的时间帧
+            energy_scores = time_features_array[cluster_indices, 1] * time_features_array[cluster_indices, 2]  # 幅度 * 加权值
+            max_energy_idx = cluster_indices[np.argmax(energy_scores)]
+            t_time = time_features_array[max_energy_idx, 0]  # 时间
+            
+            # 转换为STFT帧索引
+            t_idx = np.argmin(np.abs(times - t_time))
+            
+            # 记录聚类中心的时间帧索引和平均能量
+            avg_energy = time_features_array[max_energy_idx, 1]
+            cluster_centers.append((t_idx, avg_energy))
     
-    print(f"检测到的{len(cluster_centers)}个高频聚类中心:")
-    for i, (t, f_idx, amp) in enumerate(cluster_centers):
-        print(f"聚类 #{i+1}: 时间={times[t]:.2f}秒, 频率={freqs[f_idx]:.1f}Hz, 幅度={librosa.amplitude_to_db(amp):.1f}dB")
+    print(f"检测到的{len(cluster_centers)}个高频时间聚类中心:")
+    for i, (t_idx, avg_energy) in enumerate(cluster_centers):
+        print(f"聚类中心 #{i+1}: 时间={times[t_idx]:.2f}秒, 平均高频能量={librosa.amplitude_to_db(avg_energy):.1f}dB")
     
     # 创建处理后的STFT矩阵
     processed_magnitude = magnitude.copy()
     
-    # 在每个聚类中心周围应用衰减
-    for t, f_idx, _ in cluster_centers:
-        # 定义时间和频率的窗口范围
-        t_window = 8  # 时间范围窗口大小，比之前大以覆盖整个聚类
-        f_window = 15  # 频率范围窗口大小，比之前大以覆盖整个聚类
+    # 在每个聚类中心时间的整个频率范围上应用衰减，但只对高频部分
+    for t_idx, _ in cluster_centers:
+        # 定义时间窗口范围
+        t_window = 8  # 时间范围窗口大小
         
         # 安全地获取周围区域
-        t_start = max(0, t - t_window)
-        t_end = min(processed_magnitude.shape[1], t + t_window + 1)
-        f_start = max(0, f_idx - f_window)
-        f_end = min(processed_magnitude.shape[0], f_idx + f_window + 1)
+        t_start = max(0, t_idx - t_window)
+        t_end = min(processed_magnitude.shape[1], t_idx + t_window + 1)
         
-        # 应用增益
-        gain_factor = 10 ** (gain_db / 20)  # 将dB转换为线性增益因子
-        
-        # 创建高斯衰减窗口，使得衰减在中心最强，向外逐渐减弱
-        t_coords, f_coords = np.meshgrid(
-            np.arange(t_start, t_end), 
-            np.arange(f_start, f_end)
-        )
-        gaussian_window = np.exp(-0.5 * (
-            ((t_coords - t) / (t_window / 2)) ** 2 + 
-            ((f_coords - f_idx) / (f_window / 2)) ** 2
-        ))
-        
-        # 应用衰减，中心点衰减最大，周围逐渐减弱
-        attenuation_factor = 1 - ((1 - gain_factor) * gaussian_window)
-        processed_magnitude[f_start:f_end, t_start:t_end] *= attenuation_factor
+        # 只对高频部分应用增益
+        for f_idx in high_freq_indices:
+            # 应用增益
+            gain_factor = 10 ** (gain_db / 20)  # 将dB转换为线性增益因子
+            
+            # 创建高斯时间衰减窗口，使得衰减在中心时间最强，向外逐渐减弱
+            t_coords = np.arange(t_start, t_end)
+            gaussian_window = np.exp(-0.5 * (((t_coords - t_idx) / (t_window / 2)) ** 2))
+            
+            # 应用衰减，中心时间点衰减最大，周围逐渐减弱
+            attenuation_factor = 1 - ((1 - gain_factor) * gaussian_window)
+            processed_magnitude[f_idx, t_start:t_end] *= attenuation_factor
     
     # 重建音频信号
     processed_D = processed_magnitude * np.exp(1j * phase)
@@ -482,12 +669,12 @@ if __name__ == "__main__":
         original_mp3 = "原始音频片段.mp3"
         save_as_mp3(audio, sr, original_mp3)
         
-        # 使用DPCA算法处理高频聚类
-        print("使用DPCA算法检测并处理高频聚类...")
-        processed_clusters = detect_high_freq_clusters(
+        # 使用加权DPCA算法处理高频聚类
+        print("使用加权DPCA算法检测并处理高频聚类...")
+        processed_clusters = detect_high_freq_clusters_with_weights(
             audio, sr, 
             time_start=1, time_end=3, 
-            freq_threshold=5000, 
+            freq_threshold=4000, 
             gain_db=-20, 
             n_clusters=3
         )
@@ -527,62 +714,77 @@ if __name__ == "__main__":
     string_audio_path = os.path.join(ROOT_DIR, string_file_name)
     
     try:
-        # 先检查模型是否已存在
-        model_path = os.path.join(ROOT_DIR, "string_instrument_classifier.joblib")
-        model_exists = os.path.exists(model_path)
-        
-        if not model_exists and os.path.exists(string_audio_path):
-            # 训练弦乐识别模型
-            print("开始训练弦乐识别模型...")
-            clf, accuracy = train_string_instrument_classifier(string_audio_path)
-            print(f"弦乐识别模型训练完成，准确率: {accuracy:.4f}")
-        elif not model_exists:
-            print(f"错误: 找不到训练素材文件 '{string_audio_path}'")
-            print(f"请将 '{string_file_name}' 文件放到以下目录并再次运行:\n{ROOT_DIR}")
-        else:
-            print(f"模型已存在: {model_path}")
-        
-        # 提取弦乐和非弦乐示例
         if os.path.exists(string_audio_path):
-            print("从交响乐中提取弦乐和非弦乐示例...")
+            print("从交响乐中提取弦乐示例...")
             
-            # 加载完整音频
+            # 加载完整音频片段
             full_audio, sr = librosa.load(string_audio_path, sr=None, duration=120)  # 加载前2分钟
             
-            # 提取非弦乐部分（前1/3）
-            non_string_start_time = 10  # 秒
-            non_string_duration = 4  # 秒
-            non_string_offset = int(non_string_start_time * sr)
-            non_string_segment = full_audio[non_string_offset:non_string_offset + int(non_string_duration * sr)]
+            # 提取5秒示例片段
+            example_start_time = 60  # 秒
+            example_duration = 5  # 秒
+            example_offset = int(example_start_time * sr)
+            example_segment = full_audio[example_offset:example_offset + int(example_duration * sr)]
             
-            # 保存非弦乐示例
-            non_string_mp3 = "非弦乐示例.mp3"
-            save_as_mp3(non_string_segment, sr, non_string_mp3)
-            plot_spectrogram(non_string_segment, sr, "非弦乐示例频谱图", "非弦乐示例频谱图.png")
+            # 保存原始示例
+            string_example_mp3 = "弦乐原始示例_5秒.mp3"
+            save_as_mp3(example_segment, sr, string_example_mp3)
+            plot_spectrogram(example_segment, sr, "弦乐原始示例频谱图", "弦乐原始示例频谱图.png")
             
-            # 提取弦乐部分（后2/3）
-            string_start_time = 60  # 秒
-            string_duration = 4  # 秒
-            string_offset = int(string_start_time * sr)
-            string_segment = full_audio[string_offset:string_offset + int(string_duration * sr)]
+            # 使用改进的弦乐提取方法
+            print("使用改进的方法提取弦乐部分...")
+            extracted_strings = improved_string_extraction(example_segment, sr)
+            improved_strings_mp3 = "改进提取的弦乐_5秒.mp3"
+            save_as_mp3(extracted_strings, sr, improved_strings_mp3)
+            plot_spectrogram(extracted_strings, sr, "改进提取的弦乐频谱图", "改进提取的弦乐频谱图.png")
             
-            # 保存弦乐示例
-            string_mp3 = "弦乐示例.mp3"
-            save_as_mp3(string_segment, sr, string_mp3)
-            plot_spectrogram(string_segment, sr, "弦乐示例频谱图", "弦乐示例频谱图.png")
+            print(f"弦乐原始示例已保存到: {os.path.join(ROOT_DIR, string_example_mp3)}")
+            print(f"提取的弦乐已保存到: {os.path.join(ROOT_DIR, improved_strings_mp3)}")
             
-            # 从弦乐示例中提取纯弦乐声音
-            if os.path.exists(model_path):
-                print("从弦乐示例中提取纯弦乐声音...")
-                extracted_strings = extract_string_instruments(string_segment, sr, model_path)
-                extracted_strings_mp3 = "提取的纯弦乐声音.mp3"
-                save_as_mp3(extracted_strings, sr, extracted_strings_mp3)
-                plot_spectrogram(extracted_strings, sr, "提取的纯弦乐声音频谱图", "提取的纯弦乐声音频谱图.png")
-                print(f"纯弦乐声音已保存到: {os.path.join(ROOT_DIR, extracted_strings_mp3)}")
+            # 比较两种弦乐提取方法
+            if os.path.exists(os.path.join(ROOT_DIR, "string_instrument_classifier.joblib")):
+                print("使用机器学习模型提取弦乐以供比较...")
+                ml_extracted_strings = extract_string_instruments(example_segment, sr)
+                ml_strings_mp3 = "机器学习提取的弦乐_5秒.mp3"
+                save_as_mp3(ml_extracted_strings, sr, ml_strings_mp3)
+                plot_spectrogram(ml_extracted_strings, sr, "机器学习方法提取的弦乐频谱图", "机器学习提取的弦乐频谱图.png")
+                print(f"机器学习提取的弦乐已保存到: {os.path.join(ROOT_DIR, ml_strings_mp3)}")
+            else:
+                print("原始弦乐识别模型不存在，跳过比较步骤")
+                
+            # 可视化比较两种方法的频谱
+            plt.figure(figsize=(12, 12))
             
-            print(f"弦乐示例已保存到: {os.path.join(ROOT_DIR, string_mp3)}")
-            print(f"非弦乐示例已保存到: {os.path.join(ROOT_DIR, non_string_mp3)}")
-        
+            plt.subplot(3, 1, 1)
+            S_orig = np.abs(librosa.stft(example_segment))
+            librosa.display.specshow(librosa.amplitude_to_db(S_orig, ref=np.max),
+                                    y_axis='log', x_axis='time', sr=sr)
+            plt.title('原始音频频谱')
+            plt.colorbar(format='%+2.0f dB')
+            
+            plt.subplot(3, 1, 2)
+            S_improved = np.abs(librosa.stft(extracted_strings))
+            librosa.display.specshow(librosa.amplitude_to_db(S_improved, ref=np.max),
+                                    y_axis='log', x_axis='time', sr=sr)
+            plt.title('改进方法提取的弦乐频谱')
+            plt.colorbar(format='%+2.0f dB')
+            
+            if os.path.exists(os.path.join(ROOT_DIR, "string_instrument_classifier.joblib")):
+                plt.subplot(3, 1, 3)
+                S_ml = np.abs(librosa.stft(ml_extracted_strings))
+                librosa.display.specshow(librosa.amplitude_to_db(S_ml, ref=np.max),
+                                        y_axis='log', x_axis='time', sr=sr)
+                plt.title('机器学习方法提取的弦乐频谱')
+                plt.colorbar(format='%+2.0f dB')
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(ROOT_DIR, "弦乐提取方法比较.png"))
+            plt.close()
+            
+            print("弦乐提取方法比较图已保存!")
+        else:
+            print(f"错误: 找不到训练素材文件 '{string_audio_path}'")
+            print(f"请将 '{string_file_name}' 文件放到以下目录并再次运行:\n{ROOT_DIR}")
     except Exception as e:
         print(f"弦乐处理时出错: {str(e)}")
         import traceback
