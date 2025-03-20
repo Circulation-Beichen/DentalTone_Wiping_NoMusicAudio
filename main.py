@@ -165,9 +165,9 @@ if __name__ == "__main__":
         # 应用齿音消除
         print("应用齿音消除...")
         processed = dynamic_deesser(processed_clusters, sr, 
-                                  threshold_db=-18,
+                               threshold_db=-18,
                                   reduction_db=10,
-                                  crossover=6000)
+                               crossover=6000)
         
         # 生成处理后音频的频谱图
         print("生成处理后音频频谱图...")
