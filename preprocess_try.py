@@ -329,18 +329,19 @@ def main():
     # 创建输出文件夹
     output_dir, method1_dir, method2_dir, method3_dir, audio_dir = create_output_folders()
     
-    # 检查目录中的音频文件
-    print("查找可用的音频文件...")
-    audio_files = [f for f in os.listdir(ROOT_DIR) if f.endswith(('.mp3', '.wav'))]
+    # 指定使用的音频文件
+    audio_file = "原始音频片段_01.mp3"
+    audio_path = os.path.join(ROOT_DIR, audio_file)
     
-    if not audio_files:
-        print("错误: 目录中没有可用的音频文件")
-        return
-    
-    # 使用第一个可用的音频文件
-    audio_file = audio_files[0] if len(audio_files) > 0 else None
-    if audio_file is None:
-        print("错误: 找不到可用的音频文件")
+    # 检查文件是否存在
+    if not os.path.exists(audio_path):
+        print(f"错误: 音频文件 '{audio_path}' 不存在!")
+        audio_files = [f for f in os.listdir(ROOT_DIR) if f.endswith('.mp3')]
+        if audio_files:
+            print(f"当前目录中的MP3文件: {audio_files}")
+            print("请确保'原始音频片段_01.mp3'文件存在")
+        else:
+            print("目录中没有MP3文件，请添加所需的音频文件")
         return
     
     print(f"将使用音频文件: {audio_file}")
@@ -348,7 +349,7 @@ def main():
     # 加载音频文件(指定只加载前30秒)
     start_sec = 0
     end_sec = 30
-    y, sr = load_audio(os.path.join(ROOT_DIR, audio_file), start_sec=start_sec, end_sec=end_sec)
+    y, sr = load_audio(audio_path, start_sec=start_sec, end_sec=end_sec)
     
     # 保存原始音频的频谱图
     plot_spectrogram(y, sr, f'原始音频频谱图: {audio_file} ({start_sec}-{end_sec}秒)', "原始频谱图.png", output_dir)
