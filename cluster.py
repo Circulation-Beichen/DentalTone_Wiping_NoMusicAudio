@@ -415,7 +415,7 @@ def process_audio(audio_path, model, output_dir):
     
     # 创建参数表格数据
     param_labels = ['xi', 'min_samples', 'min_cluster_size', 'low_weight', 'high_weight']
-    param_values = [f"{xi:.3f}", f"{min_samples:d}", f"{min_cluster_size:.3f}", f"{low_weight:.3f}", f"{high_weight:.3f}"]
+    param_values = [f"{xi:.3f}", f"{min_samples:.1f}", f"{min_cluster_size:.3f}", f"{low_weight:.3f}", f"{high_weight:.3f}"]
     param_desc = [
         'OPTICS提取层次结构陡度阈值', 
         '核心点最小样本数', 
@@ -457,7 +457,7 @@ def process_audio(audio_path, model, output_dir):
     # 保存参数和聚类信息
     params = {
         'xi': float(xi),
-        'min_samples': int(min_samples),
+        'min_samples': float(min_samples),
         'min_cluster_size': float(min_cluster_size),
         'low_weight': float(low_weight),
         'high_weight': float(high_weight),
