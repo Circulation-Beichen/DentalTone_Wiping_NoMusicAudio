@@ -322,7 +322,7 @@ def perform_optics_clustering(features, time_scale, mel_scale, max_eps=None, min
     try:
         optics.fit(distance_matrix)
         # 获取聚类标签
-        labels = optics.labels_
+    labels = optics.labels_
         
         end_time = time.time()
         print(f"CPU聚类耗时: {end_time - start_time:.2f}秒")
@@ -393,7 +393,7 @@ def filter_clusters_by_frequency_span(features, labels):
                 if weight_sum > 0:
                     center = weighted_sum / weight_sum
                     cluster_centers.append(center)
-            else:
+    else:
                 # 将小跨度聚类的点标记为噪声
                 filtered_labels[labels == label] = -1
     
