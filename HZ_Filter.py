@@ -40,12 +40,16 @@ def setup_chinese_font():
 # 初始化中文字体
 setup_chinese_font()
 
-def create_output_folders():
-    """创建输出文件夹结构"""
+def create_output_folders(custom_output_dir=None):
+    """创建输出文件夹结构，可以指定自定义输出目录"""
     # 以日期时间命名主输出文件夹
     now = datetime.datetime.now()
     timestamp = now.strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join(ROOT_DIR, f"HZ滤波实验_负增益处理_{timestamp}")
+    
+    if custom_output_dir:
+        output_dir = custom_output_dir
+    else:
+        output_dir = os.path.join(ROOT_DIR, f"HZ滤波实验_负增益处理_{timestamp}")
     
     # 创建主输出文件夹
     if not os.path.exists(output_dir):
@@ -69,20 +73,22 @@ def load_audio(audio_path, start_sec=None, end_sec=None, target_sr=None):
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"找不到音频文件: {audio_path}")
     
-    # 如果没有指定时间范围，默认只加载前30秒
+    # 如果没有指定时间范围，默认加载整个音频
     if start_sec is None:
         start_sec = 0
-    if end_sec is None:
-        end_sec = 30  # 默认只加载30秒音频，避免内存溢出
-    
-    print(f"加载音频片段: {start_sec}-{end_sec}秒")
     
     # 加载音频片段，如果指定了目标采样率，则进行下采样
     if target_sr:
         print(f"将进行下采样到 {target_sr}Hz")
-        y, sr = librosa.load(audio_path, sr=target_sr, offset=start_sec, duration=(end_sec-start_sec))
+        if end_sec is None:  # 加载整个文件
+            y, sr = librosa.load(audio_path, sr=target_sr, offset=start_sec)
+        else:
+            y, sr = librosa.load(audio_path, sr=target_sr, offset=start_sec, duration=(end_sec-start_sec))
     else:
-        y, sr = librosa.load(audio_path, sr=None, offset=start_sec, duration=(end_sec-start_sec))
+        if end_sec is None:  # 加载整个文件
+            y, sr = librosa.load(audio_path, sr=None, offset=start_sec)
+        else:
+            y, sr = librosa.load(audio_path, sr=None, offset=start_sec, duration=(end_sec-start_sec))
     
     print(f"音频加载成功! 采样率: {sr}Hz, 长度: {len(y)/sr:.2f}秒")
     return y, sr
@@ -112,8 +118,42 @@ def plot_spectrogram(audio, sr, title, filename, output_dir):
     plt.savefig(os.path.join(output_dir, filename), dpi=300)
     plt.close()
 
-def apply_processing_pipeline(audio, sr, output_dir, threshold_db=-35):
-    """应用处理管道：阈值滤波 -> 低频截止 -> 微分滤波 -> 膨胀 -> DBSCAN聚类 -> 负增益处理"""
+def plot_mel_spectrogram(audio, sr, title, filename, output_dir):
+    """绘制并保存梅尔频谱图"""
+    plt.figure(figsize=(10, 6))
+    
+    # 计算梅尔频谱
+    S = librosa.feature.melspectrogram(y=audio, sr=sr, n_mels=128)
+    S_db = librosa.power_to_db(S, ref=np.max)
+    
+    # 绘制梅尔频谱图
+    img = librosa.display.specshow(S_db, x_axis='time', y_axis='mel', sr=sr)
+    plt.colorbar(img, format='%+2.0f dB')
+    plt.title(title)
+    plt.tight_layout()
+    
+    # 保存图像
+    plt.savefig(os.path.join(output_dir, filename), dpi=300)
+    plt.close()
+
+def apply_processing_pipeline(audio, sr, output_dir, threshold_db=-35, max_negative_gain_db=-20, height=10, intensity=0.5, order=2, save_intermediate=True, plot_spectrograms=True):
+    """应用处理管道：阈值滤波 -> 低频截止 -> 微分滤波 -> 膨胀 -> DBSCAN聚类 -> 负增益处理
+    
+    参数:
+        audio: 输入音频信号
+        sr: 采样率
+        output_dir: 输出目录
+        threshold_db: 阈值滤波的dB阈值
+        max_negative_gain_db: 最大负增益值(dB)
+        height: 微分滤波器高度
+        intensity: 微分滤波强度
+        order: 微分滤波阶数
+        save_intermediate: 是否保存中间处理结果
+        plot_spectrograms: 是否绘制频谱图
+    
+    返回:
+        处理后的音频信号, 原始频谱, 处理后频谱, 差异频谱
+    """
     # 计算STFT
     n_fft = 1024
     hop_length = n_fft // 4
@@ -133,28 +173,22 @@ def apply_processing_pipeline(audio, sr, output_dir, threshold_db=-35):
     # 创建阈值掩码
     threshold_mask = magnitude_db < threshold_db
     
-    # 固定参数
-    height = 10
-    intensity = 0.5
-    order = 2
-    low_freq_cut = True
-    
-    print(f"使用固定参数: 高度={height}, 强度={intensity}, 阶数={order}")
-    
     # 获取频率轴
     freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
     
     # 创建3kHz以下的频率掩码（用于低频截止）
     low_freq_mask = freqs < 3000
     
-    # 先绘制原始频谱
-    plt.figure(figsize=(15, 10))
-    
-    # 原始频谱
-    plt.subplot(2, 2, 1)
-    librosa.display.specshow(magnitude_db, x_axis='time', y_axis='log', sr=sr, hop_length=hop_length)
-    plt.colorbar(format='%+2.0f dB')
-    plt.title('原始频谱图')
+    # 如果需要绘制频谱图
+    if plot_spectrograms:
+        # 先绘制原始频谱
+        plt.figure(figsize=(15, 10))
+        
+        # 原始频谱
+        plt.subplot(2, 2, 1)
+        librosa.display.specshow(magnitude_db, x_axis='time', y_axis='log', sr=sr, hop_length=hop_length)
+        plt.colorbar(format='%+2.0f dB')
+        plt.title('原始频谱图')
     
     # 应用阈值滤波和低频截止 (第一步预处理)
     filtered_magnitude = magnitude.copy()
@@ -164,11 +198,13 @@ def apply_processing_pipeline(audio, sr, output_dir, threshold_db=-35):
     # 转换为dB用于显示
     filtered_magnitude_db = librosa.amplitude_to_db(filtered_magnitude, ref=np.max)
     
-    # 阈值滤波后的频谱
-    plt.subplot(2, 2, 2)
-    librosa.display.specshow(filtered_magnitude_db, x_axis='time', y_axis='log', sr=sr, hop_length=hop_length)
-    plt.colorbar(format='%+2.0f dB')
-    plt.title(f'预处理1: 阈值滤波({threshold_db}dB)和低频截止(3kHz)')
+    # 如果需要绘制频谱图
+    if plot_spectrograms:
+        # 阈值滤波后的频谱
+        plt.subplot(2, 2, 2)
+        librosa.display.specshow(filtered_magnitude_db, x_axis='time', y_axis='log', sr=sr, hop_length=hop_length)
+        plt.colorbar(format='%+2.0f dB')
+        plt.title(f'预处理1: 阈值滤波({threshold_db}dB)和低频截止(3kHz)')
     
     # 创建垂直方向（频率方向）的差分滤波器
     if order == 1:
@@ -316,8 +352,9 @@ def apply_processing_pipeline(audio, sr, output_dir, threshold_db=-35):
     final_audio = librosa.istft(final_D, hop_length=hop_length)
     
     # 保存处理后的音频
-    filename = f"步骤4_聚类提取_h{height}_i{intensity:.1f}_阶{order}.wav"
-    save_as_wav(final_audio, sr, filename, output_dir)
+    if save_intermediate:
+        filename = f"步骤4_聚类提取_h{height}_i{intensity:.1f}_阶{order}.wav"
+        save_as_wav(final_audio, sr, filename, output_dir)
     
     # 对提取出的特征频谱进行积分处理（频率轴方向的累积和）
     # 由于微分滤波增强了频谱的变化特征，积分操作可以在某种程度上恢复频谱的原始形态
@@ -338,16 +375,14 @@ def apply_processing_pipeline(audio, sr, output_dir, threshold_db=-35):
     integrated_audio = librosa.istft(integrated_D, hop_length=hop_length)
 
     # 保存积分后的音频
-    integrated_filename = f"步骤5_积分重建_h{height}_i{intensity:.1f}_阶{order}.wav"
-    save_as_wav(integrated_audio, sr, integrated_filename, output_dir)
+    if save_intermediate:
+        integrated_filename = f"步骤5_积分重建_h{height}_i{intensity:.1f}_阶{order}.wav"
+        save_as_wav(integrated_audio, sr, integrated_filename, output_dir)
 
     # 创建负增益掩码 - 使用积分后的频谱作为掩码
     # 积分后的频谱中能量越大，应用的负增益越强
     norm_factor = np.max(integrated_magnitude) if np.max(integrated_magnitude) > 0 else 1.0
     gain_mask = integrated_magnitude / norm_factor
-    
-    # 设置负增益的最大值（例如-20dB）
-    max_negative_gain_db = -20  # 可调整的参数
     
     # 将掩码转换为增益系数 (0到max_negative_gain_db的负增益)
     gain_factor = np.ones_like(gain_mask) - gain_mask * (1 - 10 ** (max_negative_gain_db/20))
@@ -413,20 +448,21 @@ def apply_processing_pipeline(audio, sr, output_dir, threshold_db=-35):
     plt.close()
     
     # 保存处理过程中的中间音频
-    # 阈值滤波后的音频
-    filtered_D = filtered_magnitude * np.exp(1j * phase)
-    filtered_audio = librosa.istft(filtered_D, hop_length=hop_length)
-    save_as_wav(filtered_audio, sr, f"步骤1_阈值滤波_低频截止.wav", output_dir)
-    
-    # 微分滤波后的音频
-    diff_D = filtered_mag_y_diff * np.exp(1j * phase)
-    diff_audio = librosa.istft(diff_D, hop_length=hop_length)
-    save_as_wav(diff_audio, sr, f"步骤2_微分滤波_h{height}_i{intensity:.1f}_阶{order}.wav", output_dir)
-    
-    # 膨胀后的音频
-    dilated_D = dilated_magnitude * np.exp(1j * phase)
-    dilated_audio = librosa.istft(dilated_D, hop_length=hop_length)
-    save_as_wav(dilated_audio, sr, f"步骤3_膨胀处理.wav", output_dir)
+    if save_intermediate:
+        # 阈值滤波后的音频
+        filtered_D = filtered_magnitude * np.exp(1j * phase)
+        filtered_audio = librosa.istft(filtered_D, hop_length=hop_length)
+        save_as_wav(filtered_audio, sr, f"步骤1_阈值滤波_低频截止.wav", output_dir)
+        
+        # 微分滤波后的音频
+        diff_D = filtered_mag_y_diff * np.exp(1j * phase)
+        diff_audio = librosa.istft(diff_D, hop_length=hop_length)
+        save_as_wav(diff_audio, sr, f"步骤2_微分滤波_h{height}_i{intensity:.1f}_阶{order}.wav", output_dir)
+        
+        # 膨胀后的音频
+        dilated_D = dilated_magnitude * np.exp(1j * phase)
+        dilated_audio = librosa.istft(dilated_D, hop_length=hop_length)
+        save_as_wav(dilated_audio, sr, f"步骤3_膨胀处理.wav", output_dir)
     
     # 创建结果说明文件
     with open(os.path.join(output_dir, "处理结果说明.txt"), "w", encoding="utf-8") as f:
@@ -455,21 +491,86 @@ def apply_processing_pipeline(audio, sr, output_dir, threshold_db=-35):
         f.write(f"- 负增益处理: 最大负增益={max_negative_gain_db}dB，使用积分后频谱作为掩码\n\n")
         
         f.write("输出文件说明:\n")
-        f.write(f"- 处理流程对比图.png: 显示处理的每个步骤的频谱图对比\n")
-        f.write(f"- 负增益处理效果图.png: 显示负增益处理的过程和效果\n")
-        f.write(f"- 步骤1_阈值滤波_低频截止.wav: 第一步预处理后的音频\n")
-        f.write(f"- 步骤2_微分滤波_h{height}_i{intensity:.1f}_阶{order}.wav: 应用微分滤波后的音频\n")
-        f.write(f"- 步骤3_膨胀处理.wav: 应用膨胀操作后的音频\n")
-        f.write(f"- 步骤4_聚类提取_h{height}_i{intensity:.1f}_阶{order}.wav: 应用DBSCAN聚类后的特征音频\n")
-        f.write(f"- 步骤5_积分重建_h{height}_i{intensity:.1f}_阶{order}.wav: 特征频谱积分后的音频\n")
+        if plot_spectrograms:
+            f.write(f"- 处理流程对比图.png: 显示处理的每个步骤的频谱图对比\n")
+            f.write(f"- 负增益处理效果图.png: 显示负增益处理的过程和效果\n")
+        if save_intermediate:
+            f.write(f"- 步骤1_阈值滤波_低频截止.wav: 第一步预处理后的音频\n")
+            f.write(f"- 步骤2_微分滤波_h{height}_i{intensity:.1f}_阶{order}.wav: 应用微分滤波后的音频\n")
+            f.write(f"- 步骤3_膨胀处理.wav: 应用膨胀操作后的音频\n")
+            f.write(f"- 步骤4_聚类提取_h{height}_i{intensity:.1f}_阶{order}.wav: 应用DBSCAN聚类后的特征音频\n")
+            f.write(f"- 步骤5_积分重建_h{height}_i{intensity:.1f}_阶{order}.wav: 特征频谱积分后的音频\n")
         f.write(f"- 最终处理_负增益{max_negative_gain_db}dB_h{height}_i{intensity:.1f}_阶{order}.wav: 应用积分后的负增益处理的最终音频\n")
     
-    return negative_gain_audio
+    # 返回处理后的音频和频谱数据以供外部使用
+    return negative_gain_audio, magnitude_db, negative_gain_db, diff_db
+
+def process_audio_file(audio_path, output_dir=None, target_sr=16000, threshold_db=-35, 
+                      max_negative_gain_db=-20, height=10, intensity=0.5, order=2, 
+                      save_intermediate=True, plot_spectrograms=True):
+    """处理单个音频文件，支持外部调用
+    
+    参数:
+        audio_path: 输入音频路径
+        output_dir: 自定义输出目录，如果为None则自动创建
+        target_sr: 目标采样率
+        threshold_db: 阈值滤波的dB阈值
+        max_negative_gain_db: 最大负增益值(dB)
+        height: 微分滤波器高度
+        intensity: 微分滤波强度
+        order: 微分滤波阶数
+        save_intermediate: 是否保存中间处理结果
+        plot_spectrograms: 是否绘制频谱图
+    
+    返回:
+        处理后的音频数据, 采样率, 输出目录
+    """
+    # 创建输出文件夹
+    if output_dir is None:
+        output_dir, hz_filter_dir, audio_dir = create_output_folders()
+    else:
+        output_dir, hz_filter_dir, audio_dir = create_output_folders(output_dir)
+    
+    # 加载音频文件
+    y, sr = load_audio(audio_path, target_sr=target_sr)
+    
+    # 文件名
+    audio_file = os.path.basename(audio_path)
+    
+    # 保存原始音频的频谱图和梅尔频谱图
+    if plot_spectrograms:
+        plot_spectrogram(y, sr, f'原始音频频谱图(下采样{sr}Hz): {audio_file}', 
+                        "原始频谱图.png", output_dir)
+        plot_mel_spectrogram(y, sr, f'原始音频梅尔频谱图(下采样{sr}Hz): {audio_file}',
+                            "原始梅尔频谱图.png", output_dir)
+    
+    # 应用处理流程
+    processed_audio, orig_spec, proc_spec, diff_spec = apply_processing_pipeline(
+        y, sr, audio_dir, 
+        threshold_db=threshold_db,
+        max_negative_gain_db=max_negative_gain_db,
+        height=height,
+        intensity=intensity,
+        order=order,
+        save_intermediate=save_intermediate,
+        plot_spectrograms=plot_spectrograms
+    )
+    
+    # 绘制处理后的梅尔频谱图
+    if plot_spectrograms:
+        plot_mel_spectrogram(processed_audio, sr, 
+                            f'处理后音频梅尔频谱图: {audio_file}',
+                            "处理后梅尔频谱图.png", output_dir)
+    
+    print(f"\n频率轴微分滤波+频率自适应膨胀+负增益处理实验完成! 所有结果已保存到: {output_dir}")
+    print(f"使用下采样率: {sr}Hz, 阈值: {threshold_db}dB")
+    print(f"微分滤波参数: 高度={height}, 强度={intensity}, 阶数={order}")
+    print(f"完成膨胀操作、DBSCAN聚类和负增益处理")
+    
+    return processed_audio, sr, output_dir
 
 def main():
-    # 创建输出文件夹
-    output_dir, hz_filter_dir, audio_dir = create_output_folders()
-    
+    """作为独立程序运行时的入口函数"""
     # 指定使用的音频文件
     audio_file = "原始音频片段_01.mp3"
     audio_path = os.path.join(ROOT_DIR, "音频素材", audio_file)
@@ -505,26 +606,20 @@ def main():
                 print("无法找到任何MP3文件，请确保音频文件存在")
                 return
     
-    print(f"将使用音频文件: {audio_path}")
-    
     # 使用下采样减少运算量，下采样到16kHz
     target_sr = 16000
-    start_sec = 0
-    end_sec = 30
-    y, sr = load_audio(audio_path, start_sec=start_sec, end_sec=end_sec, target_sr=target_sr)
-    
-    # 保存原始音频的频谱图
-    plot_spectrogram(y, sr, f'原始音频频谱图(下采样{target_sr}Hz): {audio_file} ({start_sec}-{end_sec}秒)', 
-                    "原始频谱图.png", output_dir)
-    
-    # 应用整个处理流程
     threshold_db = -35
-    processed_audio = apply_processing_pipeline(y, sr, audio_dir, threshold_db)
     
-    print(f"\n频率轴微分滤波+频率自适应膨胀+负增益处理实验完成! 所有结果已保存到: {output_dir}")
-    print(f"使用下采样率: {sr}Hz, 阈值: {threshold_db}dB")
-    print(f"微分滤波参数: 高度=10, 强度=0.5, 阶数=2")
-    print(f"完成膨胀操作、DBSCAN聚类和负增益处理")
+    # 处理音频文件
+    process_audio_file(
+        audio_path, 
+        target_sr=target_sr,
+        threshold_db=threshold_db,
+        max_negative_gain_db=-20,
+        height=10,
+        intensity=0.5,
+        order=2
+    )
 
 if __name__ == "__main__":
     main()
